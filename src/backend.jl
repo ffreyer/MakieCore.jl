@@ -1,11 +1,18 @@
 using Cairo
 
+# Maybe backend as singleton component?
+
+@simple_component CairoContextComponent Cairo.CairoContext
+...
+
+
 """
     struct CairoScreen{S} <: AbstractScreen
+
 A "screen" type for CairoMakie, which encodes a surface
 and a context which are used to draw a Scene.
 """
-struct CairoScreen{S}
+@component struct CairoScreen{S}
     surface::S
     context::Cairo.CairoContext
 end
@@ -25,6 +32,13 @@ function CairoScreen(w, h; device_scaling_factor = 1, antialias = Cairo.ANTIALIA
     return CairoScreen(surf, ctx)
 end
 
+
+
+################################################################################
+### Rendering System
+################################################################################
+
+
 function rgbatuple(c::Colorant)
     rgba = RGBA(c)
     red(rgba), green(rgba), blue(rgba), alpha(rgba)
@@ -33,13 +47,13 @@ end
 to_2d_scale(x::Number) = Vec2f0(x)
 to_2d_scale(x::Vec) = Vec2f0(x)
 
-function project_position(scene, point, model)
+function project_position(camera, point, model)
     # use transform func
-    res = scene.camera.resolution[]
+    res = camera.resolution
     p4d = to_ndim(Vec4f0, to_ndim(Vec3f0, point, 0f0), 1f0)
-    clip = scene.camera.projectionview[] * model * p4d
+    clip = camera.projectionview * model * p4d
     @inbounds begin
-    # between -1 and 1
+        # between -1 and 1
         p = (clip ./ clip[4])[Vec(1, 2)]
         # flip y to match cairo
         p_yflip = Vec2f0(p[1], -p[2])
@@ -50,61 +64,73 @@ function project_position(scene, point, model)
     return p_0_to_1 .* res
 end
 
-project_scale(scene, s::Number, model = Mat4f0(I)) = project_scale(scene, Vec2f0(s), model)
+project_scale(cam, s::Number, model = Mat4f0(I)) = project_scale(cam, Vec2f0(s), model)
 
-function project_scale(scene, s, model = Mat4f0(I))
+function project_scale(camera, s, model = Mat4f0(I))
     p4d = to_ndim(Vec4f0, s, 0f0)
-    p = @inbounds (scene.camera.projectionview[] * model * p4d)[Vec(1, 2)] ./ 2f0
-    return p .* scene.camera.resolution[]
+    p = @inbounds (camera.projectionview[] * model * p4d)[Vec(1, 2)] ./ 2f0
+    return p .* camera.resolution[]
 end
 
-function draw_marker(ctx, m, pos, scale, strokecolor, strokewidth, marker_offset)
 
-    marker_offset = marker_offset + scale ./ 2
+struct CairoScatter <: AbstractRenderSystem end
 
-    pos += Point2f0(marker_offset[1], -marker_offset[2])
-
-    # Cairo.scale(ctx, scale...)
-    Cairo.move_to(ctx, pos[1] + scale[1]/2, pos[2])
-    Cairo.arc(ctx, pos[1], pos[2], scale[1]/2, 0, 2*pi)
-    Cairo.fill_preserve(ctx)
-
-    Cairo.set_source_rgba(ctx, rgbatuple(strokecolor)...)
-    Cairo.set_line_width(ctx, Float64(strokewidth))
-    Cairo.stroke(ctx)
+# all that a scatter could have but doesn't necessarily need to have
+function Overseer.requested_componets(::CairoScatter)
+    (
+        Parent, SpatialXYZ, Color, CharMarker, CircleMarker, MarkerSpace,
+        Scale2D, Offset2D, StrokeColor, StrokeWidth, Transform, Camera,
+        TransformMarker
+    )
 end
 
-function draw_atomic(screen::CairoScreen, p::Scatter)
-    ctx = screen.context
-    model = p.transformation.model[]
-    isempty(p.positions) && return
-    size_model = p.transform_marker ? model : Mat4f0(I)
+function Overseer.update(::CairoScatter, m::AbstractLedger)
+    ctx = singleton(m, CairoContextComponent)
 
-    # if we give size in pixels, the size is always equal to that value
-    is_pixelspace = p.markerspace == Pixel
-    broadcast_foreach(p.positions, p.color, p.markersize, p.strokecolor,
-                      p.strokewidth, p.marker, p.markeroffset) do point, col,
-                          markersize, strokecolor, strokewidth, marker, mo
+    # components
+    parents = m[Parent]
+    positions = m[SpatialXYZ]
+    colors = m[Color]
+    char_markers = m[CharMarker]
+    circle_markers = m[CircleMarker]
+    markersizes = m[Scale2D]
+    markeroffsets = m[Offset2D]
+    space = m[MarkerSpace]
+    transform_marker = m[TransformMarker]
+    strokecolors = m[StrokeColor]
+    strokewidths = m[StrokeWidth]
+    transforms = m[Transform]
+    cameras = m[Camera]
 
-        scale = if is_pixelspace
-            to_2d_scale(markersize)
+    # is_pixelspace = p.markerspace == Pixel
+    for e in @entities_with(parents && positions && (char_markers || circle_markers))
+        parent = parents[e]
+
+        # All of these (hidden) if's probably suck for performance...
+        in_pixelspace = fallback_get(space, e, parent) == Pixel
+        camera = fallback_get(cameras, e, parent)
+        transform = fallback_get(transform, e, parent)
+        should_transform = haskey(transform_marker, e) || haskey(transform_marker, parent)
+        if in_pixelspace
+            scale =  fallback_get(markersize, e, parent)
+            offset = fallback_get(markeroffsets, e, parent)
         else
-            # otherwise calculate a scaled size
-            project_scale(p, markersize, size_model)
+            size_model = should_transform ? transform.model : Mat4f0(I)
+            scale = project_scale(camera, fallback_get(markersize, e, parent), size_model)
+            offset = project_scale(camera, fallback_get(markeroffsets, e, parent), size_model)
         end
-        offset = if is_pixelspace
-            to_2d_scale(mo)
-        else
-            project_scale(p, mo, size_model)
-        end
+        strokecolor = fallback_get(strokecolor, e, parent)
+        strokewidth = fallback_get(strokewidth, e, parent)
+        color = fallback_get(colors, e, parent)
 
-        pos = project_position(p, point, model)
+        marker = haskey(char_markers, e) ? char_markers[e] : circle_markers[parent]
 
-        isnan(pos) && return
-
+        pos = project_position(..., positions[e], transform.model)
+        isnan(pos) && continue
+        
         Cairo.set_source_rgba(ctx, rgbatuple(col)...)
-
         draw_marker(ctx, marker, pos, scale, strokecolor, strokewidth, offset)
     end
+
     nothing
 end
